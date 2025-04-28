@@ -7,13 +7,9 @@
 //   * Optim  : SGD with grad‑clip ±1   (lr 3 × 10⁻⁴)
 // ----------------------------------------------------------------------------
 #include <math.h>
-
 #include <stdio.h>
-
 #include <stdlib.h>
-
 #include <string.h>
-
 #include <time.h>
 
 /* ─── configuration ─────────────────────────────────────────────── */
@@ -204,7 +200,7 @@ static Dense * dense_create(int in , int out) {
   return d;
 }
 static void dense_forward(const Dense * d,
-  const double * x, double * y) {
+ const double * x, double * y) {
   for (int o = 0; o < d -> out; ++o) {
     double z = d -> b[o];
     for (int i = 0; i < d -> in; ++i) z += d -> w[o * d -> in + i] * x[i];
