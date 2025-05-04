@@ -14,12 +14,8 @@
 #include <raylib.h>
 
 /* ─── configuration ─────────────────────────────────────────────── */
-#define LEN 512 /* audio frame length               */
+#define LEN 2048 /* audio frame length               */
 #define CH_IN 1 /* mono                             */
-#define ENC_FILT 16 /* filters in encoder conv          */
-#define DEC_FILT 16 /* filters in decoder t‑conv        */
-#define KERNEL 4 /* kernel size                      */
-#define STRIDE 4 /* stride (4 → 2048 ↔ 512)          */
 #define LATENT_DIM 2 /* z dimensionality                 */
 #define EPS 1e-7
 
@@ -236,16 +232,18 @@ int main(void) {
     srand((unsigned) time(NULL));
    
     /* encoder */
-    Conv1D * enc_conv = conv_create(CH_IN, ENC_FILT, LEN, KERNEL, STRIDE, 0);
-    int ENC_LEN = enc_conv -> out_len; /* 2048 → 512 */
-    int FLAT = ENC_FILT * ENC_LEN;
-    Dense * enc_fc = dense_create(FLAT, LATENT_DIM * 2);
+    Conv1D*enc_conv1 = conv_create(CH_IN, 32, LEN, 5, 2, 0); /* 2048 -> 1024 */
+    Conv1D*enc_conv2 = conv_create(32, 64, enc_conv1->out_len, 5, 2, 0); /* 1024 -> 512 */
+    int ENC_LEN = enc_conv2->out_len;
+    int FLAT = 64*ENC_LEN;
+    Dense*enc_fc = dense_create(FLAT, LATENT_DIM * 2);
    
     /* decoder */
-    Dense * dec_fc = dense_create(LATENT_DIM, DEC_FILT * ENC_LEN);
-    Conv1D * dec_tconv = conv_create(DEC_FILT, CH_IN, ENC_LEN, KERNEL, STRIDE, 1);
+    Dense*dec_fc = dense_create(LATENT_DIM, 64 * ENC_LEN);
+    Conv1D*dec_tconv1 = conv_create(64, 32, ENC_LEN, 5, 2, 1); /* 512 -> 1024 */
+    Conv1D*dec_tconv2 = conv_create(32, 1, dec_tconv1->out_len, 5, 2, 1); /* 1024 -> 2048 */
       
-    /* toy one-hot impulses */
+    /* toy sine data */
     static double data[4][LEN];
 
     for (int i = 0; i<4; i++) {
@@ -260,23 +258,22 @@ int main(void) {
         }
     }
    
-    data[0][100] = 1;
-    data[1][300] = 1;
-    data[2][500] = 1;
-    data[3][800] = 1;
-   
     const double lr = 3e-4;
-    const int epochs = 100000;
+    const int epochs = 10000;
    
     /* buffers */
-    double * enc_act = malloc(FLAT * sizeof(double));
+    double * enc_act1 = malloc(32 * enc_conv1->out_len * sizeof(double));
+    double * enc_act2 = malloc(64 * enc_conv2->out_len * sizeof(double));
     double lat[LATENT_DIM * 2], mu[LATENT_DIM], lv[LATENT_DIM];
     double z[LATENT_DIM], eps[LATENT_DIM];
-    double * dec_h = malloc(DEC_FILT * ENC_LEN * sizeof(double));
+    double * dec_h1 = malloc(64 * enc_conv2->out_len * sizeof(double));
+    double * dec_h2 = malloc(32 * dec_tconv1->out_len * sizeof(double));
     double * logits = malloc(LEN * sizeof(double));
     double * d_logits = malloc(LEN * sizeof(double));
-    double * delta_dec_h = malloc(DEC_FILT * ENC_LEN * sizeof(double));
-    double * delta_enc_act = malloc(FLAT * sizeof(double));
+    double * delta_d1 = malloc(32 * dec_tconv1->out_len * sizeof(double));
+    double * delta_d2 = malloc(64 * enc_conv2->out_len * sizeof(double));
+    double * delta_enc_act1 = malloc(32 * enc_conv1->out_len * sizeof(double));
+    double * delta_enc_act2 = malloc(64 * enc_conv2->out_len * sizeof(double));
     double * delta_prev_conv = malloc(CH_IN * LEN * sizeof(double));
     double delta_z[LATENT_DIM], delta_lat[LATENT_DIM * 2];
    
@@ -284,8 +281,9 @@ int main(void) {
       double loss_sum = 0;
       for (int n = 0; n < 4; ++n) {
         /* ---------- forward ---------- */
-        conv_forward(enc_conv, data[n], enc_act);
-        dense_forward(enc_fc, enc_act, lat);
+        conv_forward(enc_conv1, data[n], enc_act1);
+        conv_forward(enc_conv2, enc_act1, enc_act2);
+        dense_forward(enc_fc, enc_act2, lat);
         memcpy(mu, lat, LATENT_DIM * sizeof(double));
         memcpy(lv, lat + LATENT_DIM, LATENT_DIM * sizeof(double));
         for (int i = 0; i < LATENT_DIM; ++i) {
@@ -293,14 +291,15 @@ int main(void) {
           double std = exp(0.5 * lv[i]);
           z[i] = mu[i] + std * eps[i];
         }
-        dense_forward(dec_fc, z, dec_h);
-        conv_forward(dec_tconv, dec_h, logits);
+        dense_forward(dec_fc, z, dec_h1);
+        conv_forward(dec_tconv1, dec_h1, dec_h2);
+        conv_forward(dec_tconv2, dec_h2, logits);
    
-        /* ---------- loss ------------ (mean BCE) */
+        /* ---------- loss ------------ */
         double rec = 0;
         for (int i = 0; i < LEN; ++i) {
-          double p = sigmoid(logits[i]);
-          rec += data[n][i] * -log(fmax(p, EPS)) + (1 - data[n][i]) * -log(fmax(1 - p, EPS));
+          double e = logits[i] - data[n][i];
+          rec += 0.5 * e * e;             /* MSE */
         }
         rec /= LEN;
         double kl = 0;
@@ -310,14 +309,15 @@ int main(void) {
         loss_sum += L;
    
         /* ---------- backward ---------- */
-        for (int i = 0; i < LEN; ++i) d_logits[i] = (sigmoid(logits[i]) - data[n][i]) / LEN; /* mean BCE derivative */
+        for (int i = 0; i < LEN; ++i) d_logits[i] = (logits[i] - data[n][i]) / LEN; /* mean BCE derivative */
    
         /* decoder t‑conv → dec_h */
-        conv_backward(dec_tconv, dec_h, d_logits, lr, delta_dec_h);
+        conv_backward(dec_tconv2, dec_h2, d_logits, lr, delta_d1);
+        conv_backward(dec_tconv1, dec_h1, delta_d1, lr, delta_d2);
    
         /* dense decoder */
         memset(delta_z, 0, sizeof delta_z);
-        dense_backward(dec_fc, z, delta_dec_h, lr, delta_z);
+        dense_backward(dec_fc, z, delta_d2, lr, delta_z);
    
         /* add KL gradients */
         for (int i = 0; i < LATENT_DIM; ++i) {
@@ -326,11 +326,14 @@ int main(void) {
         }
    
         /* encoder dense */
-        memset(delta_enc_act, 0, FLAT * sizeof(double));
-        dense_backward(enc_fc, enc_act, delta_lat, lr, delta_enc_act);
+        memset(delta_enc_act1, 0, 32 * enc_conv1->out_len * sizeof(double));
+        memset(delta_enc_act2, 0, 64 * enc_conv2->out_len * sizeof(double));
+
+        dense_backward(enc_fc, enc_act2, delta_lat, lr, delta_enc_act2);
    
         /* encoder conv */
-        conv_backward(enc_conv, data[n], delta_enc_act, lr, delta_prev_conv);
+        conv_backward(enc_conv2, enc_act1, delta_enc_act2, lr, delta_enc_act1);
+        conv_backward(enc_conv1, data[n], delta_enc_act1, lr, delta_prev_conv);
       }
       if (e % 100 == 0) printf("epoch %d  loss %.4f\n", e, loss_sum / 4);
     }
@@ -339,16 +342,15 @@ int main(void) {
     puts("Generated samples:");
     for (int s = 0; s < 4; ++s) {
       for (int i = 0; i < LATENT_DIM; ++i) z[i] = randn();
-      dense_forward(dec_fc, z, dec_h);
-      conv_forward(dec_tconv, dec_h, logits);
+      dense_forward(dec_fc, z, dec_h1);
+      conv_forward(dec_tconv1, dec_h1, dec_h2);
+      conv_forward(dec_tconv2, dec_h2, logits);
       printf("%d: [%.3f, %.3f, %.3f, %.3f ...]\n", s + 1,
-        sigmoid(logits[0]), sigmoid(logits[1]), sigmoid(logits[2]), sigmoid(logits[3]));
+        logits[0], logits[1], logits[2], logits[3]);
     }
 
     /* ----------  Visualize Generated Samples -------------*/
    
-
-
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     Vector2* points = (Vector2*)malloc(LEN * sizeof(Vector2));  // Allocate full LEN
 
@@ -362,8 +364,9 @@ int main(void) {
         int currentScreenHeight = GetScreenHeight();
 
         for (int i = 0; i < LATENT_DIM; ++i) z[i] = randn();
-        dense_forward(dec_fc, z, dec_h);
-        conv_forward(dec_tconv, dec_h, logits);
+        dense_forward(dec_fc, z, dec_h1);
+        conv_forward(dec_tconv1, dec_h1, dec_h2);
+        conv_forward(dec_tconv2, dec_h2, logits);
         
         float min = logits[0];
         float max = logits[0];
@@ -390,16 +393,22 @@ int main(void) {
     CloseWindow();
 
     /* ---- cleanup ---- */
-    conv_free(enc_conv);
-    conv_free(dec_tconv);
+    conv_free(enc_conv1);
+    conv_free(enc_conv2);
+    conv_free(dec_tconv1);
+    conv_free(dec_tconv2);
     dense_free(enc_fc);
     dense_free(dec_fc);
-    free(enc_act);
-    free(dec_h);
+    free(enc_act1);
+    free(enc_act2);
+    free(dec_h1);
+    free(dec_h2);
     free(logits);
     free(d_logits);
-    free(delta_dec_h);
-    free(delta_enc_act);
+    free(delta_d1);
+    free(delta_d2);
+    free(delta_enc_act1);
+    free(delta_enc_act2);
     free(delta_prev_conv);
     return 0;
 }
