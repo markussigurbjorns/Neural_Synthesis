@@ -52,6 +52,12 @@ static inline double sigmoid(double x) {
     return 1 / (1 + exp(-x));
 }
 
+static inline double tanh_clip(double x){
+    if (x>5)  return 1;
+    if (x<-5) return -1;
+    return tanh(x);
+}
+
 /* ─── Conv1D / Transposed‑Conv1D struct ─────────────────────────── */
 typedef struct {
     int in_ch, out_ch, kernel, stride, in_len, out_len;
@@ -258,8 +264,8 @@ int main(void) {
         }
     }
    
-    const double lr = 3e-4;
-    const int epochs = 10000;
+    const double lr = 1e-4;
+    const int epochs = 100000;
    
     /* buffers */
     double * enc_act1 = malloc(32 * enc_conv1->out_len * sizeof(double));
@@ -294,12 +300,16 @@ int main(void) {
         dense_forward(dec_fc, z, dec_h1);
         conv_forward(dec_tconv1, dec_h1, dec_h2);
         conv_forward(dec_tconv2, dec_h2, logits);
+        int valid = dec_tconv2->out_len;        /* 2045 */
+        for(int i=valid;i<LEN;++i) logits[i] = 0;   /* zero-pad tail */
    
         /* ---------- loss ------------ */
         double rec = 0;
         for (int i = 0; i < LEN; ++i) {
-          double e = logits[i] - data[n][i];
+          double y = tanh_clip(logits[i]);
+          double e = y - data[n][i];
           rec += 0.5 * e * e;             /* MSE */
+          d_logits[i] = (1.0 - y*y) * e / LEN;    /* dL/dlogits  (chain-rule)    */
         }
         rec /= LEN;
         double kl = 0;
@@ -309,7 +319,6 @@ int main(void) {
         loss_sum += L;
    
         /* ---------- backward ---------- */
-        for (int i = 0; i < LEN; ++i) d_logits[i] = (logits[i] - data[n][i]) / LEN; /* mean BCE derivative */
    
         /* decoder t‑conv → dec_h */
         conv_backward(dec_tconv2, dec_h2, d_logits, lr, delta_d1);
